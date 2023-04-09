@@ -136,7 +136,7 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error){
 	// day1: 假定请求参数是字符串类型
 	// New函数 New(typ Type) Value, Value表示指向新的类型为typ零值的指针
 	req.argv = reflect.New(reflect.TypeOf(""))
-	// Value.Interface函数返回空接口, 底层值设置为Value对应类型的值
+	// Value.Interface函数返回空接口, 底层值设置为Value对应类型的值(这里为string指针)
 	if err = cc.ReadBody(req.argv.Interface()); err != nil{
 		log.Println("rpc server: read argv err:", err)
 	}

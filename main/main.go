@@ -35,12 +35,14 @@ func main() {
 	cc := codec.NewGobCodec(conn)
 	// send request & receive response
 	for i := 0; i < 5; i++ {
+		// RPC请求: Header部分
 		h := &codec.Header{
 			ServiceMethod: "Foo.Sum",
 			Seq:           uint64(i),
 		}
-		// 发送消息: header + body
+		// 发送RPC请求: header + body
 		_ = cc.Write(h, fmt.Sprintf("geerpc req %d", h.Seq))
+
 		// 读取应答信息的header, 存放到h指向的Header结构体中
 		_ = cc.ReadHeader(h)
 		var reply string
