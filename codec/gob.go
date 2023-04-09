@@ -43,6 +43,7 @@ func (c *GobCodec) ReadBody(body interface{}) error{
 	return c.dec.Decode(body)
 }
 
+// 带有缓冲区的写操作, 需要最后执行flush操作
 func (c *GobCodec) Write(h *Header, body interface{}) (err error)  {
 	defer func() {
 		// 将缓冲区的数据发送
