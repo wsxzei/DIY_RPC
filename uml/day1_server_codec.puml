@@ -1,0 +1,36 @@
+
+@startuml
+
+
+== server与client建立TCP连接 ==
+
+
+client -> codec1: 调用GobCodec构造函数\n传入Conn对象
+activate codec1 #DarkSalmon
+codec1 -> client: GobCodec实例
+deactivate codec1
+
+client -> client: 构造RPC请求\n(Option+Header+Body)
+client -> codec1: 将RPC请求提供给编码器
+activate codec1 #FFBBBB
+codec1  -> codec2: RPC请求编码为字节流\n通过网络传递给服务端
+deactivate codec1
+
+activate codec2 #FFFDDD
+server -> codec2: 从连接中读取请求Request\n(Header+Body)
+codec2 -> server : 解码字节流数据, 得到Request结构体(header+argv)
+deactivate codec2
+
+server->server: 处理请求:\n生成响应数据, 写入req.replyv
+server->codec2: header与replyv(body数据)提供给编码器
+activate codec2 #FF77DD
+codec2->codec1: 编码响应数据\n通过网络传输给客户端
+deactivate codec2
+
+client->codec1: 读取响应数据\nheader+body
+activate codec1 #FFBBBB
+codec1->client: 解码响应数据
+deactivate codec1
+
+== 进行RPC通信 ==
+@enduml
