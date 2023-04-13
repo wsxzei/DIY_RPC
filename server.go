@@ -15,6 +15,8 @@ const(
 	MagicNumber = 0x3bef5c
 )
 
+// 消息的格式为:  |Option | Header1 | Body1 | Header2 | Body2 | ...
+
 // Option Json编码Option, CodeType决定Header+Body的编码方式
 type Option struct {
 	MagicNumber int // 魔数用于标记是什么rpc请求
@@ -58,9 +60,9 @@ func (server *Server) Accept(listener net.Listener){
 }
 
 // ServerConn
-// 1. 首先使用json反序列化, 得到Option实例, 检查MagicNumber和CodeType是否正确
-// 2. 随后根据CodeType得到对应的消息编解码器
-// 3. 将反序列化的工作交给serverCodec完成
+// 1. 首先使用json反序列化, 得到Option实例, 检查MagicNumber和CodeType, 确定rpc请求的编码方式
+// 2. 根据CodeType获取对应的消息编解码器的构造函数, 并实例化编解码器
+// 3. 将rpc请求的反序列化的工作交给serverCodec完成
 ///
 func (server *Server) ServerConn(conn io.ReadWriteCloser){
 	var opt Option
@@ -86,9 +88,11 @@ func (server *Server) ServerConn(conn io.ReadWriteCloser){
 var invalidRequest = struct{}{}
 
 // serverCodec
-// 1. 读取请求
-// 2. 处理请求
-// 3. 回复请求 /
+// 死循环中重复如下逻辑:
+// 1. 利用编解码器, 反序列化得到rpc请求req
+// 2. 对于每一个rpc请求, 启动一个go协程进行处理
+// 注: WaitGroup的作用是 当读取请求出现错误时, 当前协程等待所有handler子协程完成工作后才退出
+///
 func (server *Server) serverCodec(codec codec.Codec){
 	// new(Type)函数创建一个Type类型的实例, 返回该实例的指针
 	// make仅用于创建map、slice、chan类型的实例, 返回值(引用)而非指针
