@@ -2,9 +2,9 @@ package main
 
 import (
 	"DIY_RPC"
+	"DIY_RPC/codec"
 	"encoding/json"
 	"fmt"
-	"DIY_RPC/codec"
 	"log"
 	"net"
 	"time"
