@@ -39,12 +39,13 @@ func (c *GobCodec) ReadHeader(h *Header) error {
 	return c.dec.Decode(h)
 }
 
+// ReadBody 调用decoder.Decode方法读取字节流, 并解码为消息体; Decode方法只接受底层值为指针类型的入参;
 func (c *GobCodec) ReadBody(body interface{}) error {
 	return c.dec.Decode(body)
 }
 
 // 带有缓冲区的写操作, 需要最后执行flush操作
-// 调用Encoder#Encode方法, 需要确保接口的动态值非指针类型, 非nil
+// 调用Encoder#Encode方法, 需要确保接口的动态值 非(指针类型且为nil)
 func (c *GobCodec) Write(h *Header, body interface{}) (err error) {
 	defer func() {
 		// 将缓冲区的数据发送
