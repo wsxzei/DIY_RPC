@@ -174,8 +174,8 @@ func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.
 	// 请求完成
 	defer wg.Done()
 	// 若argv为指针类型的Value, Elem返回指向的值(若不为Interface或Pointer类型, 程序会恐慌)
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("greerpc resp %d", req.h.Seq))
+	log.Println("[DIY_RPC server] header:", req.h, "\targ:{", req.argv.Elem(), "}")
+	req.replyv = reflect.ValueOf(fmt.Sprintf("DIY_RPC resp, seq:%d", req.h.Seq))
 
 	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 }

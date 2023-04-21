@@ -1,2 +1,3 @@
-module "DIY_RPC"
+module DIY_RPC
 
+go 1.18
