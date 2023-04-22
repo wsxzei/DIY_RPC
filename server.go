@@ -4,11 +4,13 @@ import (
 	"DIY_RPC/codec"
 	"encoding/json"
 	"fmt"
+	"go/ast"
 	"io"
 	"log"
 	"net"
 	"reflect"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -33,6 +35,126 @@ type request struct {
 	h *codec.Header
 	// 请求参数和响应参数
 	argv, replyv reflect.Value
+}
+
+// 一个函数能被远程调用, 需要满足五个条件:
+// 1. 方法所属的type是导出的;
+// 2. 方法是导出的(大写字母开头);
+// 3. 方法有两个入参, 均为导出或内建类型;
+// 4. 第二个入参(返回值)必须为指针;
+// 5. 返回值为error类型
+///
+type methodType struct {
+	method    reflect.Method // 方法本身
+	ArgType   reflect.Type   // 第一个参数的类型
+	ReplyType reflect.Type   // 第二个参数的类型
+	numCalls  uint64         // 方法调用次数
+}
+
+// 创建argv实例
+func (m *methodType) newArgv() reflect.Value {
+	var argv reflect.Value
+	if m.ArgType.Kind() == reflect.Pointer {
+		// ArgType为指针类型, argv应该是指向相同类型的指针
+		argv = reflect.New(m.ArgType.Elem())
+	} else {
+		// ArgType不为指针, Value.Elem()得到可取地址的reflect.Value
+		argv = reflect.New(m.ArgType).Elem()
+	}
+	return argv
+}
+
+func (m *methodType) newReplyv() reflect.Value {
+	// ReplyType必须为指针类型
+	replyv := reflect.New(m.ReplyType.Elem())
+	switch m.ReplyType.Elem().Kind() {
+	// replyv为slice、map引用类型的指针, 指向缺省值为nil的实例, 需要初始化
+	case reflect.Map:
+		replyv.Elem().Set(reflect.MakeMap(m.ReplyType.Elem()))
+	case reflect.Slice:
+		replyv.Elem().Set(reflect.MakeSlice(m.ReplyType.Elem(), 0, 0))
+	}
+	return replyv
+}
+
+type service struct {
+	name      string                 // 映射的结构体的名称
+	typ       reflect.Type           // 结构体的reflect.Type
+	receiver  reflect.Value          // 结构体实例的reflect.Value, 方法接收者
+	methodMap map[string]*methodType // 映射的结构体中, 符合条件的方法
+}
+
+func newService(receiver interface{}) *service {
+	s := new(service)
+	s.receiver = reflect.ValueOf(receiver)
+	// Indirect方法获取入参v指向的值, 如果v不为指针, 则返回v;
+	// Name方法返回被定义类型的包内名称, 若是*T、struct{}等未定义的类型, 则返回空字符串
+	s.name = reflect.Indirect(s.receiver).Type().Name()
+	s.typ = reflect.TypeOf(receiver)
+	if !ast.IsExported(s.name) {
+		// 打印错误信息, 随后os.Exit(1)
+		log.Fatalf("rpc server: %s is not a valid service name", s.name)
+	}
+	// 注册service结构体的方法
+	s.registerMethod()
+
+	return s
+}
+
+// registerMethod 过滤符合条件的方法:
+// 1. 两个导出或内置类型的入参(反射时为3个, 第0个为实例自身)
+// 2. 返回值只有一个error类型
+///
+func (s *service) registerMethod() {
+	s.methodMap = make(map[string]*methodType)
+	for i := 0; i < s.typ.NumMethod(); i++ {
+		method := s.typ.Method(i)
+		mType := method.Type
+		// 验证入参和返回值的个数
+		if mType.NumIn() != 3 || mType.NumOut() != 1 {
+			continue
+		}
+		// 验证唯一的返回值是否为error接口
+		// 注意: 不能使用reflect.TypeOf(error(nil)), 获取的是error接口的底层类型(未定义), 打印为<nil>
+		if mType.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
+			continue
+		}
+		// 获取两个入参, 验证是否为导出或内建类型
+		argType, replyType := mType.In(0), mType.In(1)
+		if !isExportedOrBuiltinType(argType) || !isExportedOrBuiltinType(replyType) {
+			continue
+		}
+		s.methodMap[method.Name] = &methodType{
+			method:    method,
+			ArgType:   argType,
+			ReplyType: replyType,
+			numCalls:  0,
+		}
+		log.Printf("rpc server: register %s.%s\n", s.name, method.Name)
+	}
+}
+
+// isExportedOrBuiltinType 判断入参t是否为内建类型或导出类型
+// 导出类型: 名称的首字母大写;
+// 内建类型: 包路径为空, 非内建类型至少有一层包路径
+///
+func isExportedOrBuiltinType(t reflect.Type) bool {
+	// IsExported验证是否name首字母大写; PkgPath返回完整的包路径,
+	return ast.IsExported(t.Name()) || t.PkgPath() == ""
+}
+
+// call 通过反射调用指定方法
+func (s *service) call(m *methodType, argVal, replyVal reflect.Value) error {
+	// 累加调用次数
+	atomic.AddUint64(&m.numCalls, 1)
+	// 获取函数类型reflect.Value, Call方法执行反射调用
+	f := m.method.Func
+	returnValues := f.Call([]reflect.Value{s.receiver, argVal, replyVal})
+	// 接口为nil, 说明没有底层类型, 即不存在错误
+	if err := returnValues[0].Interface(); err != nil {
+		return err.(error)
+	}
+	return nil
 }
 
 type Server struct{}
