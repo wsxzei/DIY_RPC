@@ -3,12 +3,13 @@ package DIY_RPC
 import (
 	"DIY_RPC/codec"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"go/ast"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -35,6 +36,8 @@ type request struct {
 	h *codec.Header
 	// 请求参数和响应参数
 	argv, replyv reflect.Value
+	mType        *methodType // 请求的方法
+	svc          *service    // 方法所处的服务
 }
 
 // 一个函数能被远程调用, 需要满足五个条件:
@@ -96,16 +99,16 @@ func newService(receiver interface{}) *service {
 		log.Fatalf("rpc server: %s is not a valid service name", s.name)
 	}
 	// 注册service结构体的方法
-	s.registerMethod()
+	s.registerMethods()
 
 	return s
 }
 
-// registerMethod 过滤符合条件的方法:
+// registerMethods 过滤符合条件的方法:
 // 1. 两个导出或内置类型的入参(反射时为3个, 第0个为实例自身)
 // 2. 返回值只有一个error类型
 ///
-func (s *service) registerMethod() {
+func (s *service) registerMethods() {
 	s.methodMap = make(map[string]*methodType)
 	for i := 0; i < s.typ.NumMethod(); i++ {
 		method := s.typ.Method(i)
@@ -119,11 +122,16 @@ func (s *service) registerMethod() {
 		if mType.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
 			continue
 		}
-		// 获取两个入参, 验证是否为导出或内建类型
-		argType, replyType := mType.In(0), mType.In(1)
+		// 获取两个入参, 验证是否为导出或内建类型(第0个入参为接收者自身)
+		argType, replyType := mType.In(1), mType.In(2)
 		if !isExportedOrBuiltinType(argType) || !isExportedOrBuiltinType(replyType) {
 			continue
 		}
+		// replyType必须为指针类型
+		if replyType.Kind() != reflect.Pointer {
+			continue
+		}
+
 		s.methodMap[method.Name] = &methodType{
 			method:    method,
 			ArgType:   argType,
@@ -157,13 +165,52 @@ func (s *service) call(m *methodType, argVal, replyVal reflect.Value) error {
 	return nil
 }
 
-type Server struct{}
+// Server RPC服务端
+type Server struct {
+	serviceMap sync.Map // 保存服务端提供的服务
+}
 
 func NewServer() *Server {
 	return &Server{}
 }
 
 var DefaultServer = NewServer()
+
+// Register 注册服务
+func (server *Server) Register(receiver interface{}) error {
+	// 1. 调用newService, 生成Service结构体
+	s := newService(receiver)
+
+	// 2. 将服务存储到serviceMap中
+	// service.name为key, service指针为value; 如果服务存在, 则返回服务实例, 若不存在则设置为给定值;
+	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
+		return errors.New("rpc server: service already defined: " + s.name)
+	}
+	return nil
+}
+
+// findService 解析service.method, 返回service结构体和methodType结构体指针
+func (server *Server) findService(serviceMethod string) (s *service, mType *methodType, err error) {
+	// 1. 解析出服务名和方法名
+	dotIdx := strings.LastIndex(serviceMethod, ".")
+	if dotIdx == -1 {
+		err = errors.New("rpc server: service.method request ill-formed[" +
+			serviceMethod + "]")
+		return
+	}
+	serviceName, methodName := serviceMethod[:dotIdx], serviceMethod[dotIdx+1:]
+	svc, ok := server.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc server: can't find service[" + serviceName + "]")
+		return
+	}
+	s = svc.(*service)
+	mType = s.methodMap[methodName]
+	if mType == nil {
+		err = errors.New("rpc server: can't find method[" + methodName + "]")
+	}
+	return
+}
 
 // Accept 调用Listener接口Accept函数从全连接队列中取出TCP连接
 func (server *Server) Accept(listener net.Listener) {
@@ -206,6 +253,7 @@ func (server *Server) ServerConn(conn io.ReadWriteCloser) {
 	server.serverCodec(f(conn))
 }
 
+// 空结构体不占据内存空间, 在rpc通信场景下作为占位符, 可以节省带宽
 var invalidRequest = struct{}{}
 
 // serverCodec
@@ -258,47 +306,50 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 	}
 	req := &request{h: header}
 
-	// day1: 假定请求参数是字符串类型
-	// New函数 New(typ Type) Value, Value表示指向新的类型为typ零值的指针
-	/*
-			初学疑惑: 字符串为不可变类型, 为什么可以通过指向字符串空值的指针, 能将字节流写入缓冲区并转化为字符串？
-			解答: 字符串可以看作结构体, 包含指针+长度字段, unsafe.Sizeof返回16字节, 即两个机器字
-			示例:
-		    strPtrVal := reflect.New(reflect.TypeOf(""))
-		    if strPtrVal.Kind() == reflect.Ptr {
-		       if strPtrVal.Elem().Kind() == reflect.String {
-		          fmt.Println("strPtr is a pointer to the string. ")
-		          // Elem()方法得到的字符串Value是可取地址的, 因此可以使用Set方法设置字符串值
-		          strPtrVal.Elem().SetString("Hello World")
-		       }
-		    }
-		    // 将指针Value转为(*string)类型, 从而可以解引用得到str
-		    str := *(strPtrVal.Interface().(*string))
-	*/
-	req.argv = reflect.New(reflect.TypeOf(""))
+	/* 1. 从请求头中获取serviceMethod, 经过服务发现返回service和methodType指针 */
+	req.svc, req.mType, err = server.findService(req.h.ServiceMethod)
 
-	// Value.Interface函数返回空接口, 底层值设置为Value对应类型的值(这里为string指针)
+	if err != nil {
+		return req, err
+	}
+
+	/* 2. 通过newArgv和newReplyv方法, 创建出rpc调用方法的两个入参实例 */
+	// 初始化请求参数, argv是指针类型的Value 或 可取地址的Value
+	req.argv = req.mType.newArgv()
+	// 初始化响应值, replyv为指针类型(ReplyType必须为指针类型)
+	req.replyv = req.mType.newReplyv()
+
+	// 编解码器反序列化得到请求body, 传入指针类型的interface{}接收结果
+	// 对于非指针但是可取地址的req.argv, 先得到它的指针Value, 再转化为空接口
+	argValInf := req.argv.Interface()
+	if req.argv.Kind() != reflect.Pointer {
+		argValInf = req.argv.Addr().Interface()
+	}
+
+	/* 3. 将请求报文的body反序列化, 得到rpc调用的第一个入参 */
 	// ReadBody方法调用decoder.Decode方法读取字节流, 并解码为消息体; Decode方法只接受底层值为指针类型的入参;
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
-		log.Println("rpc server: read argv err:", err)
+	if err = cc.ReadBody(argValInf); err != nil {
+		log.Println("rpc server: read body err[", err, "]")
+		return req, err
 	}
 
 	return req, nil
 }
 
-// 处理请求:
-// 将请求头和req.argv指针执行的元素打印出来, 设置replyv为Value类型, 具体值为字符串类型
-// 使用sendResponse, 将响应信息发送出去
-// TODO, 需要调用注册的rpc方法, 获取正确的返回参数
-// day1: 打印argv, 发送hello world
+// handleRequest 处理请求:
+// day3版本, request中包含请求的service和methodType信息, 反射调用服务方法, 将请求头和返回值发送给客户端
 ///
 func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	// 请求完成
 	defer wg.Done()
-	// 若argv为指针类型的Value, Elem返回指向的值(若不为Interface或Pointer类型, 程序会恐慌)
-	log.Println("[DIY_RPC server] header:", req.h, "\targ:{", req.argv.Elem(), "}")
-	req.replyv = reflect.ValueOf(fmt.Sprintf("DIY_RPC resp, seq:%d", req.h.Seq))
-
+	// 反射调用请求的服务方法
+	err := req.svc.call(req.mType, req.argv, req.replyv)
+	if err != nil {
+		// 设置请求头的Error字段, 并将空结构体作为body(无效的请求)
+		req.h.Error = err.Error()
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+		return
+	}
 	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 }
 
