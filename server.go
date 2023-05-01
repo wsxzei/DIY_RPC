@@ -4,6 +4,7 @@ import (
 	"DIY_RPC/codec"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"io"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -24,11 +26,16 @@ const (
 type Option struct {
 	MagicNumber int // 魔数用于标记是什么rpc请求
 	CodeType    codec.Type
+
+	/* day4: 新增超时设定 */
+	ConnectTimeout time.Duration // 连接超时
+	HandleTimeout  time.Duration // 处理报文超时
 }
 
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodeType:    codec.GobType,
+	MagicNumber:    MagicNumber,
+	CodeType:       codec.GobType,
+	ConnectTimeout: time.Second * 10, // 默认10秒连接超时
 }
 
 type request struct {
@@ -167,7 +174,8 @@ func (s *service) call(m *methodType, argVal, replyVal reflect.Value) error {
 
 // Server RPC服务端
 type Server struct {
-	serviceMap sync.Map // 保存服务端提供的服务
+	serviceMap    sync.Map // 保存服务端提供的服务
+	handleTimeout time.Duration
 }
 
 func NewServer() *Server {
@@ -248,6 +256,8 @@ func (server *Server) ServerConn(conn io.ReadWriteCloser) {
 		log.Panicf("rpc server: invalid codec type %s\n", opt.CodeType)
 		return
 	}
+	// 设置请求处理的超时时间, 若为0, 则表示不会超时
+	server.handleTimeout = opt.HandleTimeout
 
 	// f为编解码器的构造函数, 入参为连接对象conn, 返回编解码器
 	server.serverCodec(f(conn))
@@ -280,7 +290,7 @@ func (server *Server) serverCodec(codec codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		go server.handleRequest(codec, req, sending, wg)
+		go server.handleRequest(codec, req, sending, wg, server.handleTimeout)
 	}
 	// 若出现错误跳出循环, 等待处理请求的协程结束后, 主协程再退出
 	wg.Wait()
@@ -338,19 +348,57 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 
 // handleRequest 处理请求:
 // day3版本, request中包含请求的service和methodType信息, 反射调用服务方法, 将请求头和返回值发送给客户端
+// day4版本, 添加超时功能
 ///
-func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	// 请求完成
 	defer wg.Done()
-	// 反射调用请求的服务方法
-	err := req.svc.call(req.mType, req.argv, req.replyv)
-	if err != nil {
-		// 设置请求头的Error字段, 并将空结构体作为body(无效的请求)
-		req.h.Error = err.Error()
-		server.sendResponse(cc, req.h, invalidRequest, sending)
+	// 请求处理分为: 请求方法调用结束、方法返回结果发送完成 两个阶段;
+	called := make(chan struct{})
+	sent := make(chan struct{})
+	// finish信道: 防止处理请求的子协程阻塞
+	finished := make(chan struct{})
+	defer close(finished)
+
+	// 子协程完成服务方法的反射调用, 通过信道传递 调用完成、响应结果发送完成 事件
+	go func() {
+		err := req.svc.call(req.mType, req.argv, req.replyv)
+		select {
+		case called <- struct{}{}:
+			// 服务调用完成
+			if err != nil {
+				// 设置请求头的Error字段, 并将空结构体作为body(无效的请求)
+				req.h.Error = err.Error()
+				server.sendResponse(cc, req.h, invalidRequest, sending)
+				sent <- struct{}{} // 完成rpc响应的发送
+				return
+			}
+			server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+			sent <- struct{}{}
+		case <-finished:
+			// 处理请求超时, handleMessage协程不读取called信道, 导致子协程阻塞泄漏的情况
+			// handleMessage协程退出前, 会关闭finished信道, 子协程退出
+			close(called)
+			close(sent)
+		}
+	}()
+
+	if timeout == 0 {
+		<-called
+		<-sent
 		return
 	}
-	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+
+	select {
+	case <-time.After(timeout):
+		log.Printf("[rpc server] request handle timeout: expect within %s", timeout)
+		// time.After先于called接收到消息, 说明消息处理超时, called和sent将被阻塞
+		req.h.Error = fmt.Sprintf("[rpc server] request handle timeout: expect within %s", timeout)
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+	case <-called:
+		// called信道接收到消息, 说明处理没有超时, 继续执行server.sendResponse
+		<-sent
+	}
 }
 
 // 注意: 因为调用Codec#Write函数时, header和body是分别发送的。为了保证不同请求的应答信息的header, body顺序发送, 发送应答数据时需要加上互斥锁。

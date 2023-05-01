@@ -2,12 +2,14 @@ package DIY_RPC
 
 import (
 	"DIY_RPC/codec"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 type Call struct {
@@ -136,6 +138,19 @@ func (client *Client) receive() {
 	client.terminateCalls(err)
 }
 
+// 初始化Client结构体, 创建子协程接收服务端的响应,
+func newClientCodec(cc codec.Codec, opt *Option) *Client {
+	// 初始化Client结构体
+	client := &Client{
+		cc:      cc,
+		opt:     opt,
+		seq:     1,
+		pending: make(map[uint64]*Call),
+	}
+	go client.receive()
+	return client
+}
+
 // NewClient 创建Client实例
 // 1. 完成协议交换: 发送Option信息给服务端, 协商消息编解码方式
 // 2. 初始化Client结构体
@@ -156,19 +171,6 @@ func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 	return newClientCodec(codecFunc(conn), opt), nil
 }
 
-// 初始化Client结构体, 创建子协程接收服务端的响应,
-func newClientCodec(cc codec.Codec, opt *Option) *Client {
-	// 初始化Client结构体
-	client := &Client{
-		cc:      cc,
-		opt:     opt,
-		seq:     1,
-		pending: make(map[uint64]*Call),
-	}
-	go client.receive()
-	return client
-}
-
 func parseOptions(opts ...*Option) (*Option, error) {
 	// 如果opts为空, 或传递了nil, 使用默认Option结构体
 	if len(opts) == 0 || opts[0] == nil {
@@ -187,26 +189,66 @@ func parseOptions(opts ...*Option) (*Option, error) {
 	return opt, nil
 }
 
-// Dial 用户传入服务端地址, 创建Client实例; opts为可选参数
-func Dial(network, address string, opts ...*Option) (client *Client, err error) {
-	// ...是语法糖, 可以打散切片作为入参
+// 包装NewClient函数
+type newClientFunc func(net.Conn, *Option) (*Client, error)
+
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+// 包装newClientFunc函数调用, 增加了超时返回的功能
+func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (*Client, error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.Dial(network, address)
+
+	// 支持超时的API net.DialTimeout
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
-
-	// 如果client为nil, 返回时关闭连接
 	defer func() {
-		if client == nil {
+		// 如果client为空(即存在错误)时, 需要关闭连接
+		if err != nil {
 			conn.Close()
 		}
 	}()
-	// 发送Option结构体, 启动子协程接收响应, 创建并返回Client结构体
-	return NewClient(conn, opt)
+
+	ch := make(chan *clientResult)
+	// 解决Dial协程因为超时退出, 导致NewClient协程阻塞导致的内存泄漏
+	finished := make(chan struct{})
+	defer close(finished)
+
+	// 启动子协程执行NewClient, 执行完成后通过信道ch发送结果
+	go func() {
+		// 创建编解码器, 发送Option结构体, 启动子协程接收响应, 创建并返回Client结构体
+		client, err := f(conn, opt)
+		select {
+		case <-finished:
+			close(ch)
+		case ch <- &clientResult{client: client, err: err}:
+		}
+	}()
+	// 未设置连接超时时间, 等待客户端创建完成
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+
+	// 使用select, 如果time.After()信道先收到消息, 说明NewClient执行超时, 返回错误
+	select {
+	case result := <-ch:
+		return result.client, result.err
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("[rpc client] connect timeout: expect within %s", opt.ConnectTimeout)
+	}
+}
+
+// Dial 用户传入服务端地址, 创建Client实例; opts为可选参数
+func Dial(network, address string, opts ...*Option) (client *Client, err error) {
+	return dialTimeout(NewClient, network, address, opts...)
 }
 
 // 发送rpc请求: 入参call包括本次请求的方法, 序列号, 参数
@@ -265,8 +307,17 @@ func (client *Client) Go(serviceMethod string, args, reply interface{}, done cha
 
 // Call Call是对Go的封装, 阻塞call.Done, 等待响应返回, 是异步转同步的接口
 // 仅返回error类型, 响应结果写入reply
-func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
+func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
 	// 阻塞等待Call.Done有元素可以读, 即收到服务端对rpc请求的响应后, 调用者才能返回
-	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+	// 如果超出了context中指定的时间, 从client.pending中移除Call实例, 并返回超时错误
+	// eg:  context.WithTimeout(context.Background(), time.Second)
+	select {
+	case <-call.Done:
+		return call.Error
+	case <-ctx.Done():
+		// 移除pending中的Call实例
+		client.removeCall(call.Seq)
+		return errors.New("[rpc client] call failed: " + ctx.Err().Error())
+	}
 }
