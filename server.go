@@ -35,7 +35,7 @@ type Option struct {
 var DefaultOption = &Option{
 	MagicNumber:    MagicNumber,
 	CodeType:       codec.GobType,
-	ConnectTimeout: time.Second * 10, // 默认10秒连接超时
+	ConnectTimeout: time.Second * 100, // 默认10秒连接超时
 }
 
 type request struct {
@@ -58,7 +58,7 @@ type methodType struct {
 	method    reflect.Method // 方法本身
 	ArgType   reflect.Type   // 第一个参数的类型
 	ReplyType reflect.Type   // 第二个参数的类型
-	numCalls  uint64         // 方法调用次数
+	NumCalls  uint64         // 方法调用次数
 }
 
 // 创建argv实例
@@ -143,7 +143,7 @@ func (s *service) registerMethods() {
 			method:    method,
 			ArgType:   argType,
 			ReplyType: replyType,
-			numCalls:  0,
+			NumCalls:  0,
 		}
 		log.Printf("rpc server: register %s.%s\n", s.name, method.Name)
 	}
@@ -161,7 +161,7 @@ func isExportedOrBuiltinType(t reflect.Type) bool {
 // call 通过反射调用指定方法
 func (s *service) call(m *methodType, argVal, replyVal reflect.Value) error {
 	// 累加调用次数
-	atomic.AddUint64(&m.numCalls, 1)
+	atomic.AddUint64(&m.NumCalls, 1)
 	// 获取函数类型reflect.Value, Call方法执行反射调用
 	f := m.method.Func
 	returnValues := f.Call([]reflect.Value{s.receiver, argVal, replyVal})
@@ -244,7 +244,7 @@ func (server *Server) Accept(listener net.Listener) {
 func (server *Server) ServerConn(conn io.ReadWriteCloser) {
 	var opt Option
 	if err := json.NewDecoder(conn).Decode(&opt); err != nil {
-		log.Panicln("rpc server: options error:", err)
+		log.Println("rpc server: options error:", err)
 		return
 	}
 	if opt.MagicNumber != MagicNumber {
@@ -253,7 +253,7 @@ func (server *Server) ServerConn(conn io.ReadWriteCloser) {
 	}
 	f := codec.NewCodecFuncMap[opt.CodeType]
 	if f == nil {
-		log.Panicf("rpc server: invalid codec type %s\n", opt.CodeType)
+		log.Printf("rpc server: invalid codec type %s\n", opt.CodeType)
 		return
 	}
 	// 设置请求处理的超时时间, 若为0, 则表示不会超时

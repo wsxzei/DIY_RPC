@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -249,6 +250,23 @@ func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (*Cl
 // Dial 用户传入服务端地址, 创建Client实例; opts为可选参数
 func Dial(network, address string, opts ...*Option) (client *Client, err error) {
 	return dialTimeout(NewClient, network, address, opts...)
+}
+
+// XDial 同一的调用入口, 支持http协议
+// rpcAddr是一个通用的格式(protocol@addr)代表一个rpc服务, 例如tcp@127.0.0.1:8000
+func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client err: wrong format %q, expect protocal@addr", rpcAddr)
+	}
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		// tcp, unix或其它传输层协议
+		return Dial(protocol, addr, opts...)
+	}
 }
 
 // 发送rpc请求: 入参call包括本次请求的方法, 序列号, 参数
